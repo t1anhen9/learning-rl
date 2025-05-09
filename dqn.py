@@ -55,7 +55,7 @@ class ReplayBuffer:
 
 
 # 训练 DQN
-def train_dqn(env, q_network, target_network, episodes=10, batch_size=64, gamma=0.99,
+def train_dqn(env, q_network, target_network, episodes=1000, batch_size=64, gamma=0.99,
               epsilon=1.0, epsilon_min=0.001, epsilon_decay=0.995, lr=1e-3,
               target_update_freq=10):
 
