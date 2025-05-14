@@ -1,197 +1,162 @@
 import gymnasium as gym
+import numpy as np
+import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 from torch.distributions import Categorical
-import numpy as np
-import matplotlib.pyplot as plt
+from datetime import datetime
 
+# 使用 GPU（如果可用）
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# Reward curve plotting
-def plot_rewards(all_rewards, window=10):
-    plt.figure(figsize=(10, 5))
-    smoothed = [np.mean(all_rewards[max(0, i - window):i + 1])
-                for i in range(len(all_rewards))]
-    plt.plot(all_rewards, label="Episode Reward")
-    plt.plot(smoothed, label=f"Smoothed ({window})")
-    plt.xlabel("Episode")
-    plt.ylabel("Total Reward")
-    plt.title("GRPO on LunarLander-v2 (Gymnasium)")
-    plt.legend()
-    plt.grid()
-    plt.tight_layout()
-    plt.savefig("grpo_rewards.png")
-    plt.close()
-
-
-class GRPOPolicy(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=128):
+class ActorCritic(nn.Module):
+    def __init__(self, obs_dim, act_dim):
         super().__init__()
-        self.policy_net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Softmax(dim=-1)
+        self.shared = nn.Sequential(
+            nn.Linear(obs_dim, 128),
+            nn.ReLU()
         )
-        self.value_net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
+        self.actor = nn.Sequential(
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(64, act_dim)
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
         )
 
-    def forward(self, state):
-        probs = self.policy_net(state)
-        value = self.value_net(state)
-        return probs, value.squeeze(-1)
+    def forward(self, x):
+        shared = self.shared(x)
+        logits = self.actor(shared)
+        value = self.critic(shared)
+        return logits, value
 
 
-def collect_grpo_trajectory(env, policy, t_max=2048):
-    state, _ = env.reset()
-    states, actions, log_probs, rewards, dones, values = [], [], [], [], [], []
+def collect_trajectories(env, model, steps, gamma=0.99):
+    obs = env.reset()[0]
+    obs_list, actions, rewards, dones, values, log_probs = [], [], [], [], [], []
 
-    for _ in range(t_max):
-        state_tensor = torch.FloatTensor(state).to(device)
-        probs, value = policy(state_tensor)
-        dist = Categorical(probs)
+    for _ in range(steps):
+        obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+        logits, value = model(obs_tensor)
+        dist = Categorical(logits=logits)
         action = dist.sample()
 
-        next_state, reward, terminated, truncated, _ = env.step(action.item())
-
-        states.append(state_tensor)
-        actions.append(action)
-        log_probs.append(dist.log_prob(action).detach())
+        next_obs, reward, done, truncated, info = env.step(action.item())
+        obs_list.append(obs)
+        actions.append(action.item())
         rewards.append(reward)
-        dones.append(float(terminated or truncated))
-        values.append(value.detach())
+        dones.append(done)
+        values.append(value.item())
+        log_probs.append(dist.log_prob(action).item())
 
-        if terminated or truncated:
-            state, _ = env.reset()
-        else:
-            state = next_state
+        obs = next_obs
+        if done or truncated:
+            obs = env.reset()[0]
 
-    return states, actions, log_probs, rewards, dones, values
+    return {
+        "obs": np.array(obs_list),
+        "actions": np.array(actions),
+        "rewards": np.array(rewards),
+        "dones": np.array(dones),
+        "values": np.array(values),
+        "log_probs": np.array(log_probs)
+    }
 
 
-def compute_advantage(rewards, dones, values, gamma=0.99):
-    returns = []
-    advantage = 0
-    values = values + [0]  # Add bootstrap value
-
+def compute_advantages(data, gamma=0.99, lam=0.95):
+    rewards, values, dones = data["rewards"], data["values"], data["dones"]
+    advantages = np.zeros_like(rewards)
+    last_gae = 0
     for t in reversed(range(len(rewards))):
-        delta = rewards[t] + gamma * values[t + 1] * (1 - dones[t]) - values[t]
-        advantage = delta + gamma * (1 - dones[t]) * advantage
-        returns.insert(0, advantage + values[t])
-
-    adv = torch.tensor(advantage).float().to(device)
-    ret = torch.tensor(returns).float().to(device)
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-    return adv, ret
+        next_value = values[t + 1] if t + 1 < len(rewards) else 0
+        delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
+        advantages[t] = last_gae = delta + gamma * lam * (1 - dones[t]) * last_gae
+    returns = advantages + values
+    return advantages, returns
 
 
-def grpo_update(policy, optimizer, states, actions, old_log_probs, advantages, returns,
-                rho=0.1, epochs=4, batch_size=64):
-    states = torch.stack(states).to(device)
-    actions = torch.stack(actions).to(device)
-    old_log_probs = torch.stack(old_log_probs).to(device)
-    advantages = advantages.detach()
-    returns = returns.detach()
+def grpo_update(model, optimizer, data, advantages, returns, old_log_probs, kl_beta=1.0):
+    obs = torch.tensor(data["obs"], dtype=torch.float32).to(device)
+    actions = torch.tensor(data["actions"], dtype=torch.int64).to(device)
+    advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
+    returns = torch.tensor(returns, dtype=torch.float32).to(device)
+    old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32).to(device)
 
-    for _ in range(epochs):
-        indices = np.arange(len(states))
-        np.random.shuffle(indices)
-        for start in range(0, len(states), batch_size):
-            end = start + batch_size
-            batch_idx = indices[start:end]
+    logits, values = model(obs)
+    dist = Categorical(logits=logits)
+    new_log_probs = dist.log_prob(actions)
+    ratio = torch.exp(new_log_probs - old_log_probs)
 
-            s_batch = states[batch_idx]
-            a_batch = actions[batch_idx]
-            old_lp = old_log_probs[batch_idx]
-            adv_batch = advantages[batch_idx]
-            ret_batch = returns[batch_idx]
+    kl_div = torch.mean(old_log_probs - new_log_probs)
+    surrogate = ratio * advantages
+    loss_actor = -torch.mean(surrogate - kl_beta * kl_div)
+    loss_critic = F.mse_loss(values.squeeze(), returns)
 
-            probs, values = policy(s_batch)
-            dist = Categorical(probs)
-            entropy = dist.entropy().mean()
-            new_log_probs = dist.log_prob(a_batch)
+    loss = loss_actor + 0.5 * loss_critic
 
-            # GRPO Loss
-            ratio = torch.exp(new_log_probs - old_lp)
-            kl_divergence = (old_lp - new_log_probs).mean()
-            policy_loss = -(ratio * adv_batch).mean() + rho * kl_divergence
-
-            value_loss = nn.MSELoss()(values, ret_batch)
-
-            loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
 
 
-def evaluate_policy(env_name, policy, episodes=5, render=True, save_video=False):
-    render_mode = "rgb_array" if save_video else ("human" if render else None)
-    env = gym.make(env_name, render_mode=render_mode)
+def evaluate_and_record(model, video_dir, episode=1, render=False):
+    eval_env = gym.make("LunarLander-v2", render_mode="rgb_array")
+    eval_env = gym.wrappers.RecordVideo(
+        eval_env,
+        video_folder=video_dir,
+        episode_trigger=lambda x: True,
+        name_prefix=f"eval"
+    )
 
-    if save_video:
-        from gymnasium.wrappers import RecordVideo
-        env = RecordVideo(env, video_folder="./grpo_videos", episode_trigger=lambda ep_id: True)
-
-    policy.eval()
-
-    for episode in range(episodes):
-        state, _ = env.reset()
-        done = False
-        total_reward = 0
-
+    model.eval()
+    for ep in range(episode):
+        obs = eval_env.reset()[0]
+        done, total_reward = False, 0
         while not done:
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+            obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
             with torch.no_grad():
-                probs, _ = policy(state_tensor)
-            action = torch.argmax(probs, dim=-1).item()
-
-            state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
+                logits, _ = model(obs_tensor)
+                action = torch.argmax(logits, dim=-1).item()
+            obs, reward, done, truncated, _ = eval_env.step(action)
             total_reward += reward
 
-            if render and render_mode == "human":
-                import time
-                time.sleep(0.02)
-
-        print(f"Evaluation Episode {episode + 1}: Reward = {total_reward:.2f}")
-
-    env.close()
+        print(f"[Evaluation] Episode {ep + 1}: Reward = {total_reward:.2f}")
+    eval_env.close()
+    model.train()
 
 
-def train_grpo(env_name="LunarLander-v2", episodes=1000, t_max=2048, gamma=0.99, lr=3e-4, rho=0.01):
-    env = gym.make(env_name, render_mode="rgb_array")
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
+def train():
+    env = gym.make("LunarLander-v2")
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.n
 
-    policy = GRPOPolicy(state_dim, action_dim).to(device)
-    optimizer = optim.Adam(policy.parameters(), lr=lr)
-    all_rewards = []
-    ep_rewards = []
+    model = ActorCritic(obs_dim, act_dim).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 
-    for episode in range(episodes):
-        states, actions, log_probs, rewards, dones, values = collect_grpo_trajectory(env, policy, t_max)
-        advs, returns = compute_advantage(rewards, dones, values, gamma)
+    video_output = f"videos/lunarlander_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(video_output, exist_ok=True)
 
-        grpo_update(policy, optimizer, states, actions, log_probs, advs, returns, rho=rho)
+    for epoch in range(1, 501):
+        data = collect_trajectories(env, model, steps=2048)
+        advantages, returns = compute_advantages(data)
+        grpo_update(model, optimizer, data, advantages, returns, data["log_probs"])
 
-        total_reward = sum(rewards)
-        ep_rewards.append(total_reward)
-        all_rewards.append(np.mean(ep_rewards[-10:]))
+        avg_reward = np.sum(data["rewards"])
+        print(f"Epoch {epoch}, Total Reward: {avg_reward:.2f}")
 
-        if (episode + 1) % 10 == 0:
-            print(f"Episode {episode+1}, Average Reward: {all_rewards[-1]:.2f}")
-            plot_rewards(ep_rewards)
+        if epoch % 50 == 0:
+            print("Running evaluation...")
+            evaluate_and_record(model, video_output)
 
     env.close()
-
-    print("Training complete. Evaluating policy...")
-    evaluate_policy(env_name, policy, episodes=3, render=True, save_video=True)
+    torch.save(model.state_dict(), "grpo_lunarlander_model.pth")
+    print("✅ Training complete. Model saved.")
 
 
 if __name__ == "__main__":
-    train_grpo()
+    train()

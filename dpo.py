@@ -133,23 +133,30 @@ env.close()
 # ===== 视频保存（仅测试一次）=====
 from gymnasium.wrappers import RecordVideo
 
-video_dir = "./videos"
-os.makedirs(video_dir, exist_ok=True)
-
+# 创建环境并包装视频记录器
 env = gym.make("LunarLander-v2", render_mode="rgb_array")
-env = RecordVideo(env, video_dir, episode_trigger=lambda x: True, name_prefix="dpo_lander_final")
+video_dir = "./videos"  # 替换为你希望保存视频的路径
+env = RecordVideo(
+    env, 
+    video_dir, 
+    episode_trigger=lambda episode_id: True,  # 每一局都录
+    name_prefix="dpo_lander_final"
+)
 
-obs, _ = env.reset()
-done = False
+num_episodes = 5  # 你想玩的次数
 
-while not done:
-    obs_tensor = torch.tensor(obs, dtype=torch.float32).to(device)
-    logits = policy(obs_tensor)
-    dist = Categorical(logits=logits)
-    action = dist.sample().item()
+for episode in range(num_episodes):
+    obs, _ = env.reset()
+    done = False
 
-    obs, reward, terminated, truncated, _ = env.step(action)
-    done = terminated or truncated
+    while not done:
+        obs_tensor = torch.tensor(obs, dtype=torch.float32).to(device)
+        logits = policy(obs_tensor)
+        dist = Categorical(logits=logits)
+        action = dist.sample().item()
+
+        obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
 
 env.close()
-print(f"🎬 视频保存在：{video_dir}")
+print(f"🎬 所有视频已保存到：{video_dir}")
